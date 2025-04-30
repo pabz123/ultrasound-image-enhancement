@@ -1,165 +1,222 @@
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import numpy as np
-import cv2
-from scipy import ndimage, signal
-from numpy.fft import fft2, ifft2, fftshift, ifftshift
+from skimage import io, color, img_as_float
+from scipy.fft import fft2, ifft2, fftshift, ifftshift
 from PIL import Image, ImageTk
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-import matplotlib.pyplot as plt
+
+# === Fourier Logic from main.py ===
+
+def load_image(path):
+    image = img_as_float(io.imread(path))
+    if image.ndim == 3:
+        image = color.rgb2gray(image)
+    return image
+
+def fourier_transform(image):
+    return fftshift(fft2(image))
+
+def create_filter(shape, radius, filter_type='low'):
+    rows, cols = shape
+    crow, ccol = rows // 2, cols // 2
+    mask = np.zeros((rows, cols), dtype=np.uint8)
+    for i in range(rows):
+        for j in range(cols):
+            dist = np.sqrt((i - crow)**2 + (j - ccol)**2)
+            if filter_type == 'low' and dist <= radius:
+                mask[i, j] = 1
+            elif filter_type == 'high' and dist > radius:
+                mask[i, j] = 1
+    return mask
+
+def apply_filter(f_shifted, mask):
+    return f_shifted * mask
+
+def inverse_fourier(f_filtered):
+    return np.abs(ifft2(ifftshift(f_filtered)))
+
+def detect_noise(f_shifted, threshold=0.1):
+    magnitude = np.abs(f_shifted)
+    noise_map = magnitude > threshold * np.max(magnitude)
+    return noise_map
+
+# === GUI Class ===
 
 class UltrasoundEnhancerApp:
     def __init__(self, root):
-        # Window setup
         self.root = root
-        self.root.title("🎯 UltraEnhance Pro")
-        self.root.geometry("1200x800")
+        self.root.title("UltraEnhance Pro – Fourier Image Enhancer")
+        self.root.geometry("1600x900")  # Increased width and height
         self.root.configure(bg="#f0f8ff")
 
-        # Title & subtitle
-        tk.Label(root, text="🎯 UltraEnhance Pro", font=("Helvetica", 24, "bold"), bg="#f0f8ff").pack(pady=5)
-        tk.Label(root, text="Advanced Ultrasound Image Enhancer", font=("Helvetica", 14), bg="#f0f8ff").pack(pady=5)
-
-        # Image data
         self.image = None
+        self.f_shift = None
         self.processed_image = None
-        self.fourier_image = None
+        self.low_pass_result = None
+        self.high_pass_result = None
+        self.noise_map = None
 
-        # Upload frame
-        upload_frame = tk.LabelFrame(root, text="Upload Image", padx=10, pady=10, bg="#f0f8ff")
-        upload_frame.pack(fill="x", padx=10, pady=5)
-        tk.Button(upload_frame, text="📂 Upload", command=self.upload_image,
-                  bg="#4CAF50", fg="white", font=("Arial", 12)).pack()
+        self.setup_ui()
 
-        # Enhancement options frame
-        opts = tk.LabelFrame(root, text="Enhancement Options", padx=10, pady=10, bg="#f0f8ff")
-        opts.pack(fill="x", padx=10, pady=5)
-        tk.Label(opts, text="Manual Filter:", bg="#f0f8ff").grid(row=0, column=0, sticky="w")
-        self.filter_combo = ttk.Combobox(opts, values=["Gaussian Low Pass","Median Filter","Bandpass Filter"])
-        self.filter_combo.current(0); self.filter_combo.grid(row=0, column=1)
-        tk.Label(opts, text="Param1 (σ/size/low):", bg="#f0f8ff").grid(row=1, column=0, sticky="w")
-        self.param1 = tk.Entry(opts); self.param1.insert(0,"10"); self.param1.grid(row=1, column=1)
-        tk.Label(opts, text="Param2 (high radius):", bg="#f0f8ff").grid(row=2, column=0, sticky="w")
-        self.param2 = tk.Entry(opts); self.param2.insert(0,"50"); self.param2.grid(row=2, column=1)
-        tk.Button(opts, text="🎯 Apply Manual", command=self.apply_filter,
-                  bg="#2196F3", fg="white").grid(row=3, column=0, pady=5)
-        tk.Button(opts, text="⚡ Auto Enhance", command=self.auto_enhance,
-                  bg="#FF5722", fg="white").grid(row=3, column=1, pady=5)
+    def setup_ui(self):
+        # Main frame to hold all the content
+        main_frame = tk.Frame(self.root, bg="#f0f8ff")
+        main_frame.grid(row=0, column=0, padx=20, pady=20, sticky="nsew")
+        main_frame.grid_rowconfigure(0, weight=1)
+        main_frame.grid_columnconfigure(0, weight=1)
 
-        # Image canvases
-        imgs = tk.Frame(root, bg="#f0f8ff")
-        imgs.pack(pady=10)
-        tk.Label(imgs, text="Original").grid(row=0, column=0)
-        tk.Label(imgs, text="Enhanced").grid(row=0, column=1)
-        tk.Label(imgs, text="Fourier Spectrum").grid(row=0, column=2)
-        self.c_orig = tk.Canvas(imgs, width=350, height=350, bg="white"); self.c_orig.grid(row=1, column=0, padx=5)
-        self.c_enh = tk.Canvas(imgs, width=350, height=350, bg="white"); self.c_enh.grid(row=1, column=1, padx=5)
-        self.c_four = tk.Canvas(imgs, width=350, height=350, bg="white"); self.c_four.grid(row=1, column=2, padx=5)
+        # Title Label (Updated)
+        title = tk.Label(main_frame, text="Ultra Image Enhancer Pro", font=("Arial", 20, "bold"), bg="#f0f8ff", fg="#2c3e50")
+        title.grid(row=0, column=0, columnspan=4, pady=10)
 
-        # Waveform & noise frame
-        wf = tk.LabelFrame(root, text="Frequency Wave & Noise Detection", padx=10, pady=10, bg="#f0f8ff")
-        wf.pack(fill="x", padx=10, pady=5)
-        tk.Button(wf, text="🔍 Show Waveform", command=self.plot_waveform).pack(side="left", padx=5)
-        tk.Button(wf, text="🧪 Detect Noise", command=self.detect_noise).pack(side="left", padx=5)
-        self.wave_canvas = None
+        # Noise Detection Section (Top section)
+        noise_frame = tk.Frame(main_frame, bg="#f0f8ff")
+        noise_frame.grid(row=1, column=0, columnspan=4, pady=10, sticky="w")
 
-        # Comparison slider
-        cmpf = tk.LabelFrame(root, text="Compare Original vs Enhanced", padx=10, pady=10, bg="#f0f8ff")
-        cmpf.pack(fill="x", padx=10, pady=5)
-        self.compare_slider = tk.Scale(cmpf, from_=0, to=350, orient="horizontal",
-                                       label="Reveal Enhanced from pixel", command=self.update_compare)
-        self.compare_slider.pack(fill="x")
-        self.c_cmp = tk.Canvas(cmpf, width=700, height=350, bg="white"); self.c_cmp.pack()
+        detect_noise_btn = tk.Button(noise_frame, text="🧠 Detect Noise", command=self.detect_noise, bg="#FF9800", fg="white", font=("Arial", 11))
+        detect_noise_btn.grid(row=0, column=0)
 
-        # Save button
-        tk.Button(root, text="💾 Save Enhanced", command=self.save_image,
-                  bg="#9C27B0", fg="white", font=("Arial", 12)).pack(pady=10)
+        self.auto_noise_toggle = tk.Checkbutton(noise_frame, text="✅ Auto Filter Noise", command=self.auto_filter_noise, bg="#f0f8ff")
+        self.auto_noise_toggle.grid(row=0, column=1, padx=10)
+
+        # Upload Button
+        upload_btn = tk.Button(main_frame, text="📂 Upload Image", command=self.upload_image, bg="#4CAF50", fg="white", font=("Arial", 12))
+        upload_btn.grid(row=2, column=0, pady=5, sticky="w")
+
+        # Filter Controls (Radius Entry, Apply Filters, Auto Enhance)
+        control_frame = tk.Frame(main_frame, bg="#f0f8ff")
+        control_frame.grid(row=3, column=0, columnspan=4, pady=10, sticky="w")
+
+        tk.Label(control_frame, text="Filter Radius:", font=("Arial", 11), bg="#f0f8ff").grid(row=0, column=0, padx=5)
+        self.radius_entry = tk.Entry(control_frame, width=6)
+        self.radius_entry.insert(0, "50")
+        self.radius_entry.grid(row=0, column=1, padx=5)
+
+        apply_btn = tk.Button(control_frame, text="🎯 Apply Filters", command=self.apply_filters, bg="#2196F3", fg="white", font=("Arial", 11))
+        apply_btn.grid(row=0, column=2, padx=10)
+
+        auto_btn = tk.Button(control_frame, text="⚡ Auto Enhance (Low & High-pass)", command=self.auto_enhance, bg="#FF5722", fg="white", font=("Arial", 11))
+        auto_btn.grid(row=0, column=3)
+
+        # Image Canvases
+        canvas_frame = tk.Frame(main_frame, bg="#f0f8ff")
+        canvas_frame.grid(row=4, column=0, columnspan=4, pady=20)
+
+        labels = ["Original", "Fourier", "Enhanced", "Low-pass Output", "High-pass Output", "Noise Map"]
+        for i, text in enumerate(labels):
+            tk.Label(canvas_frame, text=text, font=("Arial", 10), bg="#f0f8ff").grid(row=0, column=i, padx=5)
+
+        self.canvases = {}
+        for i, key in enumerate(["original", "fourier", "enhanced", "low", "high", "noise_map"]):
+            canvas = tk.Canvas(canvas_frame, width=250, height=250, bg="white")
+            canvas.grid(row=1, column=i, padx=5, pady=5)
+            self.canvases[key] = canvas
+
+        # Save Button
+        save_btn = tk.Button(main_frame, text="💾 Save Enhanced Image", command=self.save_image, bg="#9C27B0", fg="white", font=("Arial", 12))
+        save_btn.grid(row=5, column=0, columnspan=4, pady=20)
 
     def upload_image(self):
-        fp = filedialog.askopenfilename(filetypes=[("Image Files","*.png;*.jpg;*.jpeg;*.bmp;*.tif")])
-        if not fp: return
-        self.image = cv2.imread(fp, cv2.IMREAD_GRAYSCALE)
-        self.show_on_canvas(self.image, self.c_orig)
-        self.show_fourier()
+        file_path = filedialog.askopenfilename(filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp *.tif")])
+        if file_path:
+            self.image = load_image(file_path)
+            self.f_shift = fourier_transform(self.image)
+            self.display_image(self.image, "original")
+            self.display_image(np.log1p(np.abs(self.f_shift)) / np.max(np.log1p(np.abs(self.f_shift))), "fourier")
 
-    def show_on_canvas(self, img, canvas):
-        img_r = cv2.resize(img, (350,350))
-        tkimg = ImageTk.PhotoImage(Image.fromarray(img_r))
-        canvas.img = tkimg; canvas.create_image(0,0,anchor="nw",image=tkimg)
+    def display_image(self, img, key):
+        img = np.clip(img * 255, 0, 255).astype(np.uint8)
+        img = Image.fromarray(img).resize((250, 250))
+        img_tk = ImageTk.PhotoImage(img)
+        self.canvases[key].img = img_tk
+        self.canvases[key].create_image(0, 0, anchor='nw', image=img_tk)
 
-    def show_fourier(self):
-        fshift = fftshift(fft2(self.image))
-        mag = np.log1p(np.abs(fshift))
-        mag = np.uint8(255 * mag/np.max(mag))
-        self.fourier_image = mag
-        self.show_on_canvas(mag, self.c_four)
+    def apply_filters(self):
+        if self.image is None:
+            messagebox.showwarning("No image", "Upload an image first.")
+            return
 
-    def apply_filter(self):
-        if self.image is None: messagebox.showerror("Error","Upload first"); return
-        choice = self.filter_combo.get()
-        p1, p2 = float(self.param1.get()), float(self.param2.get())
-        if choice=="Gaussian Low Pass": img = self.gaussian_low_pass(self.image,p1)
-        elif choice=="Median Filter": img = ndimage.median_filter(self.image,size=int(p1))
-        else: img = self.bandpass_filter(self.image,p1,p2)
-        self.processed_image = img; self.show_on_canvas(img,self.c_enh)
+        radius = int(self.radius_entry.get())
 
-    def gaussian_low_pass(self,img,sigma):
-        fshift = fftshift(fft2(img))
-        r,c=img.shape; Y,X=np.ogrid[:r,:c]
-        c0,c1=r//2,c//2
-        mask=np.exp(-((X-c1)**2+(Y-c0)**2)/(2*sigma**2))
-        back = np.abs(ifft2(ifftshift(fshift*mask)))
-        return back
+        # Fourier domain
+        self.f_shift = fourier_transform(self.image)
 
-    def bandpass_filter(self,img,low,high):
-        fshift = fftshift(fft2(img))
-        r,c=img.shape; Y,X=np.ogrid[:r,:c]
-        dist=np.sqrt((X-c//2)**2+(Y-r//2)**2)
-        mask=(dist>=low)&(dist<=high)
-        back=np.abs(ifft2(ifftshift(fshift*mask)))
-        return back
+        # Low-pass filter
+        low_mask = create_filter(self.image.shape, radius, 'low')
+        low_filtered = apply_filter(self.f_shift, low_mask)
+        self.low_pass_result = inverse_fourier(low_filtered)
+        self.display_image(self.low_pass_result, "low")
+
+        # High-pass filter
+        high_mask = create_filter(self.image.shape, radius, 'high')
+        high_filtered = apply_filter(self.f_shift, high_mask)
+        self.high_pass_result = inverse_fourier(high_filtered)
+        self.display_image(self.high_pass_result, "high")
+
+        # Enhanced = low + high (simple combine)
+        self.processed_image = np.clip(self.low_pass_result + self.high_pass_result, 0, 1)
+        self.display_image(self.processed_image, "enhanced")
 
     def auto_enhance(self):
-        if self.image is None: messagebox.showerror("Error","Upload first"); return
-        img=ndimage.median_filter(self.image,size=3)
-        img=cv2.GaussianBlur(img,(5,5),1.5)
-        img=cv2.addWeighted(img,1.5,img,-0.5,0)
-        self.processed_image=img; self.show_on_canvas(img,self.c_enh)
+        if self.image is None:
+            messagebox.showwarning("No image", "Upload an image first.")
+            return
 
-    def plot_waveform(self):
-        if self.fourier_image is None: return
-        slice = self.fourier_image[self.image.shape[0]//2,:]
-        fig = plt.Figure(figsize=(7,2))
-        ax=fig.add_subplot(111); ax.plot(slice); ax.set_title("Freq Waveform"); ax.set_ylim(0,255)
-        if self.wave_canvas: self.wave_canvas.get_tk_widget().destroy()
-        self.wave_canvas=FigureCanvasTkAgg(fig,master=self.root); self.wave_canvas.draw()
-        self.wave_canvas.get_tk_widget().pack(pady=5)
+        self.f_shift = fourier_transform(self.image)
+
+        # Auto Enhance: Low-pass + High-pass combined
+        low_mask = create_filter(self.image.shape, 40, 'low')
+        high_mask = create_filter(self.image.shape, 40, 'high')
+
+        low_filtered = apply_filter(self.f_shift, low_mask)
+        high_filtered = apply_filter(self.f_shift, high_mask)
+
+        enhanced_f_shift = low_filtered + high_filtered
+        self.processed_image = inverse_fourier(enhanced_f_shift)
+
+        # Display all results
+        self.display_image(self.processed_image, "enhanced")
+        self.display_image(inverse_fourier(low_filtered), "low")
+        self.display_image(inverse_fourier(high_filtered), "high")
 
     def detect_noise(self):
-        if self.fourier_image is None: return
-        slice = self.fourier_image[self.image.shape[0]//2,:]
-        thresh=np.mean(slice)+2*np.std(slice)
-        peaks,_=signal.find_peaks(slice,height=thresh)
-        fig=plt.Figure(figsize=(7,2)); ax=fig.add_subplot(111)
-        ax.plot(slice); ax.scatter(peaks,slice[peaks],color='red'); ax.set_title(f"Noise Peaks: {len(peaks)}")
-        if self.wave_canvas: self.wave_canvas.get_tk_widget().destroy()
-        self.wave_canvas=FigureCanvasTkAgg(fig,master=self.root); self.wave_canvas.draw()
-        self.wave_canvas.get_tk_widget().pack(pady=5)
+        if self.image is None:
+            messagebox.showwarning("No image", "Upload an image first.")
+            return
 
-    def update_compare(self,val):
-        if self.image is None or self.processed_image is None: return
-        o=cv2.resize(self.image,(350,350)); e=cv2.resize(self.processed_image,(350,350))
-        thresh=int(val)
-        comp=np.zeros_like(o); comp[:,:thresh]=o[:,:thresh]; comp[:,thresh:]=e[:,thresh:]
-        tkimg=ImageTk.PhotoImage(Image.fromarray(np.uint8(comp)))
-        self.c_cmp.img=tkimg; self.c_cmp.create_image(0,0,anchor='nw',image=tkimg)
+        self.f_shift = fourier_transform(self.image)
+        self.noise_map = detect_noise(self.f_shift)
+
+        self.display_image(self.noise_map, "noise_map")
+
+    def auto_filter_noise(self):
+        if self.image is None:
+            messagebox.showwarning("No image", "Upload an image first.")
+            return
+
+        if self.noise_map is None:
+            messagebox.showwarning("No noise detected", "Please detect noise first.")
+            return
+
+        # Apply suppression
+        self.f_shift = fourier_transform(self.image)
+        self.f_shift *= (1 - self.noise_map)  # Suppress noise regions
+        self.processed_image = inverse_fourier(self.f_shift)
+
+        self.display_image(self.processed_image, "enhanced")
 
     def save_image(self):
-        if self.processed_image is None: messagebox.showerror("Error","No image to save"); return
-        fp=filedialog.asksaveasfilename(defaultextension='.png')
-        if fp:
-            Image.fromarray(np.uint8(np.clip(self.processed_image,0,255))).save(fp)
-            messagebox.showinfo("Saved","Image saved")
+        if self.processed_image is None:
+            messagebox.showwarning("Nothing to save", "Apply enhancement first.")
+            return
+        file_path = filedialog.asksaveasfilename(defaultextension=".png")
+        if file_path:
+            img = np.uint8(np.clip(self.processed_image * 255, 0, 255))
+            Image.fromarray(img).save(file_path)
+            messagebox.showinfo("Saved", f"Image saved to {file_path}")
 
-if __name__=='__main__':
-    root=tk.Tk(); app=UltrasoundEnhancerApp(root); root.mainloop()
+# Run
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = UltrasoundEnhancerApp(root)
+    root.mainloop()
